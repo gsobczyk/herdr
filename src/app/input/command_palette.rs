@@ -33,12 +33,7 @@ impl App {
 
         match command {
             KeybindCommand::Navigate(action) => {
-                super::navigate::execute_navigate_action_in_context(
-                    &mut self.state,
-                    &mut self.terminal_runtimes,
-                    action,
-                    context,
-                );
+                self.execute_tui_navigate_action(action, context);
             }
             KeybindCommand::CustomCommand(index) => {
                 if let Some(binding) = self.state.keybinds.custom_commands.get(index).cloned() {

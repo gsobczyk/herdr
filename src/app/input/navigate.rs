@@ -197,7 +197,11 @@ impl App {
             }
             NavigateAction::NewWorktree => {
                 if let Some(ws_idx) = workspace_action_target(&self.state, context).filter(|idx| {
-                    workspace_can_start_worktree_action(&self.state, &self.terminal_runtimes, *idx)
+                    workspace_can_start_worktree_action_with_context(
+                        &self.state,
+                        Some(&self.terminal_runtimes),
+                        *idx,
+                    )
                 }) {
                     self.state.request_new_linked_worktree = Some(ws_idx);
                     leave_navigate_mode(&mut self.state);
@@ -205,7 +209,11 @@ impl App {
             }
             NavigateAction::OpenWorktree => {
                 if let Some(ws_idx) = workspace_action_target(&self.state, context).filter(|idx| {
-                    workspace_can_start_worktree_action(&self.state, &self.terminal_runtimes, *idx)
+                    workspace_can_start_worktree_action_with_context(
+                        &self.state,
+                        Some(&self.terminal_runtimes),
+                        *idx,
+                    )
                 }) {
                     self.state.request_open_existing_worktree = Some(ws_idx);
                     leave_navigate_mode(&mut self.state);
@@ -1712,6 +1720,7 @@ fn workspace_can_start_worktree_action_with_context(
     !git_space.is_some_and(|space| space.is_linked_worktree)
 }
 
+#[cfg(test)]
 pub(crate) fn execute_navigate_action_in_context(
     state: &mut AppState,
     terminal_runtimes: &mut TerminalRuntimeRegistry,
@@ -1729,13 +1738,25 @@ pub(crate) fn execute_navigate_action_in_context(
             leave_navigate_mode(state);
         }
         NavigateAction::NewWorktree => {
-            if let Some(ws_idx) = workspace_action_target(state, context) {
+            if let Some(ws_idx) = workspace_action_target(state, context).filter(|idx| {
+                workspace_can_start_worktree_action_with_context(
+                    state,
+                    Some(&*terminal_runtimes),
+                    *idx,
+                )
+            }) {
                 state.request_new_linked_worktree = Some(ws_idx);
                 leave_navigate_mode(state);
             }
         }
         NavigateAction::OpenWorktree => {
-            if let Some(ws_idx) = workspace_action_target(state, context) {
+            if let Some(ws_idx) = workspace_action_target(state, context).filter(|idx| {
+                workspace_can_start_worktree_action_with_context(
+                    state,
+                    Some(&*terminal_runtimes),
+                    *idx,
+                )
+            }) {
                 state.request_open_existing_worktree = Some(ws_idx);
                 leave_navigate_mode(state);
             }
@@ -1769,17 +1790,15 @@ pub(crate) fn execute_navigate_action_in_context(
             }
         }
         NavigateAction::SwitchTab(idx) => {
-            let tab_exists = state
+            if state
                 .active
-                .and_then(|ws_idx| state.workspaces.get(ws_idx))
-                .is_some_and(|ws| idx < ws.tabs.len());
-            if tab_exists {
-                state.switch_tab(idx);
+                .is_some_and(|ws_idx| state.switch_workspace_tab(ws_idx, idx))
+            {
                 leave_navigate_mode(state);
             }
         }
         NavigateAction::FocusAgent(idx) => {
-            if state.focus_agent_entry(idx) {
+            if focus_agent_entry_by_index(state, idx) {
                 leave_navigate_mode(state);
             }
         }
@@ -1788,20 +1807,24 @@ pub(crate) fn execute_navigate_action_in_context(
             state.mode = Mode::Navigate;
         }
         NavigateAction::PreviousWorkspace => {
-            state.previous_workspace();
-            leave_navigate_mode(state);
+            if focus_relative_workspace(state, -1) {
+                leave_navigate_mode(state);
+            }
         }
         NavigateAction::NextWorkspace => {
-            state.next_workspace();
-            leave_navigate_mode(state);
+            if focus_relative_workspace(state, 1) {
+                leave_navigate_mode(state);
+            }
         }
         NavigateAction::PreviousAgent => {
-            state.previous_agent();
-            leave_navigate_mode(state);
+            if focus_relative_agent_entry(state, false) {
+                leave_navigate_mode(state);
+            }
         }
         NavigateAction::NextAgent => {
-            state.next_agent();
-            leave_navigate_mode(state);
+            if focus_relative_agent_entry(state, true) {
+                leave_navigate_mode(state);
+            }
         }
         NavigateAction::NewTab => {
             if state.active.is_some() {
@@ -1912,6 +1935,72 @@ pub(crate) fn execute_navigate_action_in_context(
     }
 
     finish_action_context(state, context, previous_mode);
+}
+
+#[cfg(test)]
+fn focus_relative_workspace(state: &mut AppState, delta: isize) -> bool {
+    if state.workspaces.is_empty() {
+        return false;
+    }
+    let order = state.visible_workspace_order();
+    if order.is_empty() {
+        return false;
+    }
+    let current = state.active.unwrap_or(state.selected);
+    let current_pos = order.iter().position(|idx| *idx == current).unwrap_or(0);
+    let target_pos = (current_pos as isize + delta).rem_euclid(order.len() as isize) as usize;
+    let ws_idx = order[target_pos];
+    state.switch_workspace(ws_idx);
+    true
+}
+
+#[cfg(test)]
+fn focus_agent_entry_by_index(state: &mut AppState, idx: usize) -> bool {
+    let entries = crate::ui::agent_panel_entries(state);
+    let Some(target) = entries.get(idx) else {
+        return false;
+    };
+
+    if state.active == Some(target.ws_idx)
+        && state.workspaces[target.ws_idx].focused_pane_id() == Some(target.pane_id)
+    {
+        state.ensure_agent_panel_entry_visible(idx);
+        return true;
+    }
+
+    if state.focus_pane_in_workspace(target.ws_idx, target.pane_id) {
+        state.ensure_agent_panel_entry_visible(idx);
+        return true;
+    }
+
+    false
+}
+
+#[cfg(test)]
+fn focus_relative_agent_entry(state: &mut AppState, forward: bool) -> bool {
+    let entries = crate::ui::agent_panel_entries(state);
+    if entries.is_empty() {
+        return false;
+    }
+
+    let focused_pane = state
+        .active
+        .and_then(|idx| state.workspaces.get(idx))
+        .and_then(crate::workspace::Workspace::focused_pane_id);
+    let current_idx = focused_pane.and_then(|pane_id| {
+        entries
+            .iter()
+            .position(|entry| entry.pane_id == pane_id)
+    });
+    let target_idx = match (current_idx, forward) {
+        (Some(idx), true) => (idx + 1) % entries.len(),
+        (Some(0), false) => entries.len() - 1,
+        (Some(idx), false) => idx - 1,
+        (None, true) => 0,
+        (None, false) => entries.len() - 1,
+    };
+
+    focus_agent_entry_by_index(state, target_idx)
 }
 
 fn workspace_action_target(state: &AppState, context: ActionContext) -> Option<usize> {

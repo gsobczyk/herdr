@@ -56,6 +56,7 @@ fn indexed_label(bindings: &[crate::config::IndexedKeybind]) -> String {
     parts.join(" / ")
 }
 
+#[cfg(test)]
 fn indexed_range_prefix(bindings: &[crate::config::IndexedKeybind]) -> Option<&str> {
     let run = bindings.get(..9)?;
     let prefix = run[0].label.strip_suffix('1')?;

@@ -4,20 +4,42 @@ use serde::Serialize;
 
 use crate::api::client::{ApiClient, ApiClientError};
 use crate::api::schema::{
-    AgentStatus, ClientWindowTitleSetParams, EmptyParams, Method, OutputMatch, PaneAgentState,
-    PaneWaitForOutputParams, ReadFormat, ReadSource, Request, SplitDirection, Subscription,
+    AgentStatus, ClientWindowTitleSetParams, EmptyParams, EventData, EventMatch, EventsWaitParams,
+    Method, OutputMatch, PaneAgentState, PaneWaitForOutputParams, ReadFormat, ReadSource, Request,
+    ResponseResult, SplitDirection, SubscriptionEventData, SubscriptionEventEnvelope,
+    SubscriptionEventKind,
 };
 
 mod agent;
+mod api;
+mod completion;
 mod integration;
 mod notification;
 mod pane;
 mod plugin;
+mod protocol_guard;
+mod runtime;
 mod server;
+mod spec;
 mod status;
 mod tab;
 mod workspace;
 mod worktree;
+
+const TERMINAL_SESSION_OBSERVE_USAGE: &str =
+    "usage: herdr terminal session observe <target> [--cols N] [--rows N]";
+const TERMINAL_SESSION_CONTROL_USAGE: &str =
+    "usage: herdr terminal session control <target> [--takeover] [--cols N] [--rows N]";
+
+pub(crate) fn parse_token_assignment(raw: &str) -> Result<(String, Option<String>), String> {
+    let Some((key, value)) = raw.split_once('=') else {
+        return Err("token must use NAME=VALUE".into());
+    };
+    if key.is_empty() {
+        return Err("token name must not be empty".into());
+    }
+    Ok((key.to_string(), Some(value.to_string())))
+}
 
 pub(crate) fn parse_env_assignment(raw: &str) -> Result<(String, String), String> {
     let Some((key, value)) = raw.split_once('=') else {
@@ -49,7 +71,9 @@ pub fn maybe_run(args: &[String]) -> std::io::Result<CommandOutcome> {
             };
             exit_code
         }
+        "api" => api::run_api_command(&args[2..])?,
         "status" => status::run_status_command(&args[2..])?,
+        "completion" | "completions" => completion::run_completion_command(&args[2..])?,
         "config" => run_config_command(&args[2..])?,
         "channel" => run_channel_command(&args[2..])?,
         "workspace" => workspace::run_workspace_command(&args[2..])?,
@@ -211,6 +235,7 @@ fn run_config_command(args: &[String]) -> std::io::Result<i32> {
     };
 
     match subcommand {
+        "check" => config_check(&args[1..]),
         "reset-keys" => config_reset_keys(&args[1..]),
         "help" | "--help" | "-h" => {
             print_config_help();
@@ -221,6 +246,32 @@ fn run_config_command(args: &[String]) -> std::io::Result<i32> {
             Ok(2)
         }
     }
+}
+
+fn config_check(args: &[String]) -> std::io::Result<i32> {
+    match args {
+        [] => {}
+        [flag] if matches!(flag.as_str(), "help" | "--help" | "-h") => {
+            eprintln!("usage: herdr config check");
+            return Ok(0);
+        }
+        _ => {
+            eprintln!("usage: herdr config check");
+            return Ok(2);
+        }
+    }
+
+    let diagnostics = crate::config::Config::load().diagnostics;
+    if diagnostics.is_empty() {
+        println!("config: ok");
+    } else {
+        println!("config: issues found");
+        for diagnostic in &diagnostics {
+            println!("{diagnostic}");
+        }
+    }
+
+    Ok(i32::from(!diagnostics.is_empty()))
 }
 
 fn config_reset_keys(args: &[String]) -> std::io::Result<i32> {
@@ -320,6 +371,7 @@ fn run_terminal_command(args: &[String]) -> std::io::Result<i32> {
 
     match subcommand {
         "attach" => terminal_attach(&args[1..]),
+        "session" => terminal_session(&args[1..]),
         "title" => terminal_title(&args[1..]),
         "help" | "--help" | "-h" => {
             print_terminal_help();
@@ -472,6 +524,145 @@ fn terminal_attach(args: &[String]) -> std::io::Result<i32> {
     };
     crate::client::run_terminal_attach(terminal_id, takeover)?;
     Ok(0)
+}
+
+fn terminal_session(args: &[String]) -> std::io::Result<i32> {
+    match args.first().map(|arg| arg.as_str()) {
+        Some("control") => terminal_session_control(&args[1..]),
+        Some("observe") => terminal_session_observe(&args[1..]),
+        Some("help" | "--help" | "-h") => {
+            eprintln!("{TERMINAL_SESSION_CONTROL_USAGE}");
+            eprintln!("{TERMINAL_SESSION_OBSERVE_USAGE}");
+            Ok(0)
+        }
+        _ => {
+            eprintln!("{TERMINAL_SESSION_CONTROL_USAGE}");
+            eprintln!("{TERMINAL_SESSION_OBSERVE_USAGE}");
+            Ok(2)
+        }
+    }
+}
+
+fn terminal_session_control(args: &[String]) -> std::io::Result<i32> {
+    let options = match parse_terminal_session_options(
+        args,
+        TERMINAL_SESSION_CONTROL_USAGE,
+        "control",
+        true,
+    )? {
+        Ok(options) => options,
+        Err(code) => return Ok(code),
+    };
+
+    crate::client::run_terminal_session_control(
+        options.target,
+        options.takeover,
+        options.cols,
+        options.rows,
+    )?;
+    Ok(0)
+}
+
+fn terminal_session_observe(args: &[String]) -> std::io::Result<i32> {
+    let options = match parse_terminal_session_options(
+        args,
+        TERMINAL_SESSION_OBSERVE_USAGE,
+        "observe",
+        false,
+    )? {
+        Ok(options) => options,
+        Err(code) => return Ok(code),
+    };
+
+    crate::client::run_terminal_session_observe(options.target, options.cols, options.rows)?;
+    Ok(0)
+}
+
+struct TerminalSessionOptions {
+    target: String,
+    cols: u16,
+    rows: u16,
+    takeover: bool,
+}
+
+fn parse_terminal_session_options(
+    args: &[String],
+    usage: &str,
+    command: &str,
+    allow_takeover: bool,
+) -> std::io::Result<Result<TerminalSessionOptions, i32>> {
+    if matches!(
+        args.first().map(|arg| arg.as_str()),
+        Some("help" | "--help" | "-h")
+    ) {
+        eprintln!("{usage}");
+        return Ok(Err(0));
+    }
+    let Some(target) = args.first() else {
+        eprintln!("{usage}");
+        return Ok(Err(2));
+    };
+
+    let mut cols = 120;
+    let mut rows = 40;
+    let mut takeover = false;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--takeover" if allow_takeover => {
+                takeover = true;
+                i += 1;
+            }
+            "--cols" => {
+                let Some(value) = args.get(i + 1) else {
+                    eprintln!("{usage}");
+                    return Ok(Err(2));
+                };
+                cols = parse_terminal_dimension(value, "--cols")?;
+                i += 2;
+            }
+            "--rows" => {
+                let Some(value) = args.get(i + 1) else {
+                    eprintln!("{usage}");
+                    return Ok(Err(2));
+                };
+                rows = parse_terminal_dimension(value, "--rows")?;
+                i += 2;
+            }
+            "help" | "--help" | "-h" => {
+                eprintln!("{usage}");
+                return Ok(Err(0));
+            }
+            other => {
+                eprintln!("unknown terminal session {command} option: {other}");
+                eprintln!("{usage}");
+                return Ok(Err(2));
+            }
+        }
+    }
+
+    Ok(Ok(TerminalSessionOptions {
+        target: target.clone(),
+        cols,
+        rows,
+        takeover,
+    }))
+}
+
+fn parse_terminal_dimension(raw: &str, flag: &str) -> std::io::Result<u16> {
+    let parsed = raw.parse::<u16>().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{flag} must be an integer between 1 and {}", u16::MAX),
+        )
+    })?;
+    if parsed == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{flag} must be greater than 0"),
+        ));
+    }
+    Ok(parsed)
 }
 
 fn terminal_title(args: &[String]) -> std::io::Result<i32> {
@@ -670,19 +861,75 @@ fn wait_agent_status(args: &[String]) -> std::io::Result<i32> {
         return Ok(2);
     };
 
-    wait_for_agent_change(
-        Request {
-            id: "cli:wait:agent-status".into(),
-            method: Method::EventsSubscribe(crate::api::schema::EventsSubscribeParams {
-                subscriptions: vec![Subscription::PaneAgentStatusChanged {
-                    pane_id,
-                    agent_status: Some(agent_status),
-                }],
-            }),
-        },
-        timeout_ms,
-        "timed out waiting for agent status change",
-    )
+    wait_for_agent_status_change(pane_id, agent_status, timeout_ms)
+}
+
+fn wait_for_agent_status_change(
+    pane_id: String,
+    agent_status: AgentStatus,
+    timeout_ms: Option<u64>,
+) -> std::io::Result<i32> {
+    let request = Request {
+        id: "cli:wait:agent-status".into(),
+        method: Method::EventsWait(EventsWaitParams {
+            match_event: EventMatch::PaneAgentStatusChanged {
+                pane_id,
+                agent_status,
+            },
+            timeout_ms,
+        }),
+    };
+    let response = send_request(&request)?;
+    match crate::api::client::parse_response_value(response) {
+        Ok(success) => {
+            let ResponseResult::WaitMatched { event } = success.result else {
+                return Err(std::io::Error::other("unexpected wait response result"));
+            };
+            let EventData::PaneAgentStatusChanged {
+                pane_id,
+                workspace_id,
+                agent_status,
+                agent,
+                title,
+                display_agent,
+                state_labels,
+            } = event.data
+            else {
+                return Err(std::io::Error::other("unexpected wait event data"));
+            };
+            let event = SubscriptionEventEnvelope {
+                event: SubscriptionEventKind::PaneAgentStatusChanged,
+                data: SubscriptionEventData::PaneAgentStatusChanged(
+                    crate::api::schema::PaneAgentStatusChangedEvent {
+                        pane_id,
+                        workspace_id,
+                        agent_status,
+                        agent,
+                        title,
+                        display_agent,
+                        state_labels,
+                    },
+                ),
+            };
+            println!(
+                "{}",
+                serde_json::to_string(&event).map_err(std::io::Error::other)?
+            );
+            Ok(0)
+        }
+        Err(ApiClientError::ErrorResponse(response)) => {
+            if response.error.code == "timeout" {
+                eprintln!("timed out waiting for agent status change");
+            } else {
+                eprintln!(
+                    "{}",
+                    serde_json::to_string(&response).map_err(std::io::Error::other)?
+                );
+            }
+            Ok(1)
+        }
+        Err(err) => Err(api_client_error_to_io(err)),
+    }
 }
 
 pub(super) fn wait_for_agent_change(
@@ -691,7 +938,9 @@ pub(super) fn wait_for_agent_change(
     timeout_message: &str,
 ) -> std::io::Result<i32> {
     let read_timeout = timeout_ms.map(Duration::from_millis);
-    let (ack, mut stream) = ApiClient::local()
+    let client = ApiClient::local();
+    ensure_server_protocol_compatible(&client, &request.id)?;
+    let (ack, mut stream) = client
         .subscribe_value(&request, read_timeout)
         .map_err(api_client_error_to_io)?;
     if let Err(err) = crate::api::client::parse_response_value(ack) {
@@ -744,9 +993,41 @@ pub(super) fn send_ok_request(method: Method) -> std::io::Result<i32> {
 }
 
 pub(super) fn send_request(request: &Request) -> std::io::Result<serde_json::Value> {
+    let client = ApiClient::local();
+    ensure_server_protocol_compatible(&client, &request.id)?;
+    client
+        .request_value(request)
+        .map_err(api_client_error_to_io)
+}
+
+pub(super) fn send_request_unchecked(request: &Request) -> std::io::Result<serde_json::Value> {
     ApiClient::local()
         .request_value(request)
         .map_err(api_client_error_to_io)
+}
+
+fn ensure_server_protocol_compatible(client: &ApiClient, request_id: &str) -> std::io::Result<()> {
+    let status = client.status().map_err(api_client_error_to_io)?;
+    let server_protocol = status
+        .protocol
+        .ok_or_else(|| std::io::Error::other("server ping did not include a protocol version"))?;
+    let Some(response) = protocol_guard::mismatch_response(
+        request_id,
+        server_protocol,
+        &crate::session::active_restart_after_update_guidance(),
+    ) else {
+        return Ok(());
+    };
+
+    eprintln!(
+        "{}",
+        serde_json::to_string(&response).map_err(std::io::Error::other)?
+    );
+    Err(protocol_guard::reported_error())
+}
+
+pub(crate) fn protocol_mismatch_was_reported(err: &std::io::Error) -> bool {
+    protocol_guard::was_reported(err)
 }
 
 fn api_timeout_error(err: &std::io::Error) -> bool {
@@ -908,12 +1189,15 @@ fn print_session_error(code: &str, message: &str) {
 
 fn print_config_help() {
     eprintln!("herdr config commands:");
+    eprintln!("  herdr config check  validate config.toml and print diagnostics");
     eprintln!("  herdr config reset-keys  back up config.toml and remove custom keybindings");
 }
 
 fn print_terminal_help() {
     eprintln!("herdr terminal commands:");
     eprintln!("  herdr terminal attach <terminal_id> [--takeover]");
+    eprintln!("  herdr terminal session control <target> [--takeover] [--cols N] [--rows N]");
+    eprintln!("  herdr terminal session observe <target> [--cols N] [--rows N]");
     eprintln!("  herdr terminal title set <title>");
     eprintln!("  herdr terminal title clear");
     eprintln!("  detach from direct attach with ctrl+b q; send literal ctrl+b with ctrl+b ctrl+b");

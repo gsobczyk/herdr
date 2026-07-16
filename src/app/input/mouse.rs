@@ -57,6 +57,20 @@ pub(super) enum MouseAction {
         menu: ContextMenuState,
         idx: usize,
     },
+    TogglePaneZoom {
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    },
+    ClosePane {
+        ws_idx: usize,
+        pane_id: crate::layout::PaneId,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum PaneHeaderAction {
+    ToggleZoom,
+    Close,
 }
 
 enum MobileMouseResult {
@@ -435,6 +449,21 @@ impl AppState {
                 }
 
                 if !in_sidebar {
+                    if let Some((pane_id, action)) =
+                        self.pane_header_action_at(mouse.column, mouse.row)
+                    {
+                        if self.mode != Mode::Terminal {
+                            self.mode = Mode::Terminal;
+                        }
+                        let ws_idx = self.active?;
+                        return Some(match action {
+                            PaneHeaderAction::ToggleZoom => {
+                                MouseAction::TogglePaneZoom { ws_idx, pane_id }
+                            }
+                            PaneHeaderAction::Close => MouseAction::ClosePane { ws_idx, pane_id },
+                        });
+                    }
+
                     if let Some(border) = self.find_border_at(mouse.column, mouse.row) {
                         let grab_offset = match border.direction {
                             Direction::Horizontal => border.pos.saturating_sub(mouse.column),
@@ -1360,6 +1389,22 @@ impl AppState {
             && col < area.x + area.width
     }
 
+    fn pane_header_action_at(
+        &self,
+        col: u16,
+        row: u16,
+    ) -> Option<(crate::layout::PaneId, PaneHeaderAction)> {
+        self.view.pane_action_hit_areas.iter().find_map(|area| {
+            if rect_contains(area.zoom_rect, col, row) {
+                Some((area.pane_id, PaneHeaderAction::ToggleZoom))
+            } else if rect_contains(area.close_rect, col, row) {
+                Some((area.pane_id, PaneHeaderAction::Close))
+            } else {
+                None
+            }
+        })
+    }
+
     pub(super) fn find_border_at(&self, col: u16, row: u16) -> Option<&SplitBorder> {
         self.view.split_borders.iter().find(|b| match b.direction {
             Direction::Horizontal if self.pane_borders && !self.pane_gaps => {
@@ -1856,7 +1901,9 @@ mod tests {
     use super::*;
     use crate::app::input::modal::handle_context_menu_key;
     use crate::{
-        app::state::{ContextMenuKind, ContextMenuState, MenuListState, Mode, ViewLayout},
+        app::state::{
+            AppState, ContextMenuKind, ContextMenuState, MenuListState, Mode, ViewLayout,
+        },
         detect::{Agent, AgentState},
         workspace::Workspace,
     };
@@ -1869,6 +1916,64 @@ mod tests {
             checkout_path: format!("/repo/worktree-{ws_idx}").into(),
             is_linked_worktree: ws_idx != 0,
         });
+    }
+
+    #[test]
+    fn clicking_pane_header_zoom_icon_dispatches_zoom_action() {
+        let mut state = AppState::test_new();
+        let ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        state.workspaces = vec![ws];
+        state.active = Some(0);
+        state.mode = Mode::Terminal;
+        state.view.pane_action_hit_areas = vec![crate::app::state::PaneActionHitArea {
+            pane_id,
+            zoom_rect: Rect::new(10, 1, 1, 1),
+            close_rect: Rect::new(12, 1, 1, 1),
+        }];
+        let mut runtimes = TerminalRuntimeRegistry::new();
+
+        let action = state.handle_mouse(
+            &mut runtimes,
+            mouse(MouseEventKind::Down(MouseButton::Left), 10, 1),
+        );
+
+        assert!(matches!(
+            action,
+            Some(MouseAction::TogglePaneZoom {
+                ws_idx: 0,
+                pane_id: clicked,
+            }) if clicked == pane_id
+        ));
+    }
+
+    #[test]
+    fn clicking_pane_header_close_icon_dispatches_close_action() {
+        let mut state = AppState::test_new();
+        let ws = Workspace::test_new("test");
+        let pane_id = ws.tabs[0].root_pane;
+        state.workspaces = vec![ws];
+        state.active = Some(0);
+        state.mode = Mode::Terminal;
+        state.view.pane_action_hit_areas = vec![crate::app::state::PaneActionHitArea {
+            pane_id,
+            zoom_rect: Rect::new(10, 1, 1, 1),
+            close_rect: Rect::new(12, 1, 1, 1),
+        }];
+        let mut runtimes = TerminalRuntimeRegistry::new();
+
+        let action = state.handle_mouse(
+            &mut runtimes,
+            mouse(MouseEventKind::Down(MouseButton::Left), 12, 1),
+        );
+
+        assert!(matches!(
+            action,
+            Some(MouseAction::ClosePane {
+                ws_idx: 0,
+                pane_id: clicked,
+            }) if clicked == pane_id
+        ));
     }
 
     #[tokio::test]

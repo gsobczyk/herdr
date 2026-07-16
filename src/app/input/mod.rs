@@ -359,6 +359,14 @@ impl App {
                     MouseAction::ContextMenu { menu, idx } => {
                         self.apply_context_menu_action_via_api(menu, idx)
                     }
+                    MouseAction::TogglePaneZoom { ws_idx, pane_id } => {
+                        self.focus_pane_internal_via_api(ws_idx, pane_id);
+                        self.zoom_focused_pane_via_api();
+                    }
+                    MouseAction::ClosePane { ws_idx, pane_id } => {
+                        self.focus_pane_internal_via_api(ws_idx, pane_id);
+                        let _ = self.close_focused_pane_via_api_requires_confirmation();
+                    }
                 }
             }
         }

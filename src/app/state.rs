@@ -785,8 +785,16 @@ pub struct ViewState {
     pub mobile_header_rect: Rect,
     pub mobile_menu_hit_area: Rect,
     pub toast_hit_area: Rect,
+    pub pane_action_hit_areas: Vec<PaneActionHitArea>,
     pub pane_infos: Vec<PaneInfo>,
     pub split_borders: Vec<SplitBorder>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneActionHitArea {
+    pub pane_id: crate::layout::PaneId,
+    pub zoom_rect: Rect,
+    pub close_rect: Rect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1792,6 +1800,7 @@ impl AppState {
                 mobile_header_rect: Rect::default(),
                 mobile_menu_hit_area: Rect::default(),
                 toast_hit_area: Rect::default(),
+                pane_action_hit_areas: Vec::new(),
                 pane_infos: Vec::new(),
                 split_borders: Vec::new(),
             },

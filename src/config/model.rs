@@ -800,6 +800,9 @@ pub struct UiConfig {
     pub mouse_scroll_lines: Option<NonZeroUsize>,
     /// Ask for confirmation before closing a workspace. Default: true.
     pub confirm_close: bool,
+    /// Ancestor directory segments prepended to the auto-derived workspace label.
+    /// For example, 1 turns "herdr" into "other/herdr". Default: 0.
+    pub workspace_label_parent_segments: usize,
     /// Ask for a tab name before creating a new tab. Default: true.
     pub prompt_new_tab_name: bool,
     /// Draw borders around split panes. Default: true.
@@ -1002,6 +1005,7 @@ impl Default for UiConfig {
             redraw_on_focus_gained: true,
             mouse_scroll_lines: None,
             confirm_close: true,
+            workspace_label_parent_segments: 0,
             prompt_new_tab_name: true,
             pane_borders: true,
             pane_gaps: true,

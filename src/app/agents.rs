@@ -332,6 +332,7 @@ impl App {
             self.event_tx.clone(),
             self.render_notify.clone(),
             self.render_dirty.clone(),
+            self.state.workspace_label_parent_segments,
             extra_env,
         )
         .map_err(|err| AgentStartError::SpawnFailed(err.to_string()))?;

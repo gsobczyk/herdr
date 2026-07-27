@@ -635,6 +635,12 @@
           "description": "Ask for confirmation before closing a workspace."
         },
         {
+          "key": "ui.workspace_label_parent_segments",
+          "type": "integer",
+          "default": "0",
+          "description": "Ancestor directory segments prepended to the auto-derived workspace label. For example, 1 turns \"herdr\" into \"other/herdr\"."
+        },
+        {
           "key": "ui.prompt_new_tab_name",
           "type": "boolean",
           "default": "true",

@@ -401,6 +401,7 @@ impl App {
                 &config.terminal.default_shell,
                 config.terminal.shell_mode,
                 config.session.resume_agents_on_restore,
+                config.ui.workspace_label_parent_segments,
                 event_tx.clone(),
                 render_notify.clone(),
                 render_dirty.clone(),
@@ -616,6 +617,7 @@ impl App {
             redraw_on_focus_gained: config.ui.redraw_on_focus_gained,
             mouse_scroll_lines: config.ui.mouse_scroll_lines(),
             confirm_close: config.ui.confirm_close,
+            workspace_label_parent_segments: config.ui.workspace_label_parent_segments,
             prompt_new_tab_name: config.ui.prompt_new_tab_name,
             pane_borders: config.ui.pane_borders,
             pane_gaps: config.ui.pane_gaps,
@@ -778,6 +780,7 @@ impl App {
             config.advanced.scrollback_limit_bytes,
             &config.terminal.default_shell,
             config.terminal.shell_mode,
+            config.ui.workspace_label_parent_segments,
             imports,
             app.event_tx.clone(),
             app.render_notify.clone(),
@@ -1414,6 +1417,11 @@ impl App {
                 self.state.right_click_passthrough_modifiers =
                     config.ui.right_click_passthrough_modifiers();
                 self.state.confirm_close = config.ui.confirm_close;
+                self.state.workspace_label_parent_segments =
+                    config.ui.workspace_label_parent_segments;
+                for ws in &mut self.state.workspaces {
+                    ws.label_parent_segments = config.ui.workspace_label_parent_segments;
+                }
                 self.state.prompt_new_tab_name = config.ui.prompt_new_tab_name;
                 self.state.pane_borders = config.ui.pane_borders;
                 self.state.pane_gaps = config.ui.pane_gaps;

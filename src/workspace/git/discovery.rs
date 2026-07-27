@@ -18,10 +18,13 @@ pub struct GitWorktreeInfo {
     pub is_linked_worktree: bool,
 }
 
-pub fn derive_label_from_cwd(cwd: &Path) -> String {
+/// Derive a workspace label from `cwd`. `parent_segments` prepends that many
+/// ancestor directory names (joined with `/`), e.g. `parent_segments: 1` turns
+/// `herdr` into `other/herdr`.
+pub fn derive_label_from_cwd(cwd: &Path, parent_segments: usize) -> String {
     if let Some(repo_root) = git_repo_root(cwd) {
-        if let Some(name) = repo_root.file_name().and_then(|n| n.to_str()) {
-            return name.to_string();
+        if let Some(label) = label_with_parent_segments(&repo_root, parent_segments) {
+            return label;
         }
     }
 
@@ -32,11 +35,31 @@ pub fn derive_label_from_cwd(cwd: &Path) -> String {
         }
     }
 
-    cwd.file_name()
+    label_with_parent_segments(cwd, parent_segments).unwrap_or_else(|| cwd.display().to_string())
+}
+
+fn label_with_parent_segments(path: &Path, parent_segments: usize) -> Option<String> {
+    let name = path
+        .file_name()
         .and_then(|n| n.to_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| cwd.display().to_string())
+        .filter(|s| !s.is_empty())?;
+
+    let mut segments = vec![name];
+    let mut ancestor = path.parent();
+    for _ in 0..parent_segments {
+        let parent_name = ancestor
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .filter(|s| !s.is_empty());
+        let Some(parent_name) = parent_name else {
+            break;
+        };
+        segments.push(parent_name);
+        ancestor = ancestor.and_then(Path::parent);
+    }
+
+    segments.reverse();
+    Some(segments.join("/"))
 }
 
 pub fn git_worktree_info(cwd: &Path) -> Option<GitWorktreeInfo> {
@@ -429,7 +452,7 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
 
         assert_eq!(
-            derive_label_from_cwd(&nested),
+            derive_label_from_cwd(&nested, 0),
             root.file_name().and_then(|name| name.to_str()).unwrap()
         );
 
@@ -441,9 +464,37 @@ mod tests {
         let root = temp_test_dir("label-plain");
         let label = root.file_name().and_then(|name| name.to_str()).unwrap();
 
-        assert_eq!(derive_label_from_cwd(Path::new(&root)), label);
+        assert_eq!(derive_label_from_cwd(Path::new(&root), 0), label);
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn derive_label_includes_requested_parent_segments() {
+        let root = temp_test_dir("label-parent");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let repo_name = root.file_name().and_then(|name| name.to_str()).unwrap();
+        let parent_name = root
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap();
+
+        assert_eq!(
+            derive_label_from_cwd(&nested, 1),
+            format!("{parent_name}/{repo_name}")
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn derive_label_parent_segments_clamp_at_filesystem_root() {
+        assert_eq!(derive_label_from_cwd(Path::new("/"), 5), "/");
     }
 
     #[test]

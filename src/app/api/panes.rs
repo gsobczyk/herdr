@@ -934,6 +934,7 @@ impl App {
                     self.event_tx.clone(),
                     self.render_notify.clone(),
                     self.render_dirty.clone(),
+                    self.state.workspace_label_parent_segments,
                 );
                 self.state.workspaces.push(workspace);
                 let target_ws_idx = self.state.workspaces.len() - 1;
@@ -1063,6 +1064,7 @@ impl App {
                 self.event_tx.clone(),
                 self.render_notify.clone(),
                 self.render_dirty.clone(),
+                self.state.workspace_label_parent_segments,
             );
             workspace.id = context.previous_workspace_id;
             workspace.worktree_space = context.previous_worktree_space;

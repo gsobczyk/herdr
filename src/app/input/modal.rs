@@ -382,7 +382,8 @@ pub(super) fn open_rename_workspace(
 }
 
 pub(crate) fn open_new_workspace_dialog(state: &mut AppState, cwd: std::path::PathBuf) {
-    let suggested_name = crate::workspace::derive_label_from_cwd(&cwd);
+    let suggested_name =
+        crate::workspace::derive_label_from_cwd(&cwd, state.workspace_label_parent_segments);
     state.creating_new_tab = false;
     state.requested_new_tab_name = None;
     state.pending_workspace_create_cwd = Some(cwd);
@@ -1014,7 +1015,10 @@ impl App {
         match self.state.mode {
             Mode::RenameWorkspace => {
                 if let Some(cwd) = self.state.pending_workspace_create_cwd.take() {
-                    let suggested_name = crate::workspace::derive_label_from_cwd(&cwd);
+                    let suggested_name = crate::workspace::derive_label_from_cwd(
+                        &cwd,
+                        self.state.workspace_label_parent_segments,
+                    );
                     let label = workspace_create_label(&new_name, &suggested_name);
                     self.runtime_workspace_create(
                         "tui.workspace.create_named",

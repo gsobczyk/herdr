@@ -294,6 +294,10 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Ask for confirmation before closing a workspace
 # confirm_close = true
 
+# Ancestor directory segments prepended to the auto-derived workspace label.
+# For example, 1 turns "herdr" into "other/herdr".
+# workspace_label_parent_segments = 0
+
 # Ask for a tab name before creating a new tab.
 # Set false to create tabs immediately with generated names.
 # prompt_new_tab_name = true

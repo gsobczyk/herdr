@@ -186,6 +186,9 @@ pub struct Workspace {
     pub(crate) cached_git_ahead_behind: Option<(usize, usize)>,
     /// Cached derived Git repo metadata for worktree actions and status display.
     pub(crate) cached_git_space: Option<GitSpaceMetadata>,
+    /// Ancestor directory segments prepended to the auto-derived label. Set from
+    /// `ui.workspace_label_parent_segments` at creation time.
+    pub(crate) label_parent_segments: usize,
     /// Explicit Herdr-managed worktree grouping provenance.
     pub worktree_space: Option<WorktreeSpaceMembership>,
     pub(crate) metadata_tokens: crate::metadata_tokens::MetadataTokens,
@@ -227,6 +230,7 @@ impl Workspace {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_existing_pane(
         label: Option<String>,
         tab_label: Option<String>,
@@ -235,6 +239,7 @@ impl Workspace {
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
         render_dirty: Arc<AtomicBool>,
+        label_parent_segments: usize,
     ) -> Self {
         let id = generate_workspace_id();
         let root_pane = moved.pane_id;
@@ -253,6 +258,7 @@ impl Workspace {
             cached_git_branch: git_branch(&identity_cwd),
             cached_git_ahead_behind: None,
             cached_git_space,
+            label_parent_segments,
             worktree_space: None,
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             metadata_token_sequences: HashMap::new(),
@@ -279,6 +285,7 @@ impl Workspace {
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
         render_dirty: Arc<AtomicBool>,
+        label_parent_segments: usize,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         Self::new_with_extra_env(
             initial_cwd,
@@ -290,6 +297,7 @@ impl Workspace {
             events,
             render_notify,
             render_dirty,
+            label_parent_segments,
             Vec::new(),
         )
     }
@@ -305,6 +313,7 @@ impl Workspace {
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
         render_dirty: Arc<AtomicBool>,
+        label_parent_segments: usize,
         extra_env: Vec<(String, String)>,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         Self::new_with_tab(
@@ -318,6 +327,7 @@ impl Workspace {
             render_notify,
             render_dirty,
             None,
+            label_parent_segments,
             extra_env,
         )
     }
@@ -334,6 +344,7 @@ impl Workspace {
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
         render_dirty: Arc<AtomicBool>,
+        label_parent_segments: usize,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         Self::new_argv_command_with_extra_env(
             initial_cwd,
@@ -345,6 +356,7 @@ impl Workspace {
             events,
             render_notify,
             render_dirty,
+            label_parent_segments,
             Vec::new(),
         )
     }
@@ -360,6 +372,7 @@ impl Workspace {
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
         render_dirty: Arc<AtomicBool>,
+        label_parent_segments: usize,
         extra_env: Vec<(String, String)>,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         Self::new_with_tab(
@@ -373,6 +386,7 @@ impl Workspace {
             render_notify,
             render_dirty,
             Some(argv),
+            label_parent_segments,
             extra_env,
         )
     }
@@ -389,6 +403,7 @@ impl Workspace {
         render_notify: Arc<Notify>,
         render_dirty: Arc<AtomicBool>,
         argv: Option<&[String]>,
+        label_parent_segments: usize,
         extra_env: Vec<(String, String)>,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         let id = generate_workspace_id();
@@ -441,6 +456,7 @@ impl Workspace {
                 cached_git_branch: git_branch(&initial_cwd),
                 cached_git_ahead_behind: None,
                 cached_git_space,
+                label_parent_segments,
                 worktree_space: None,
                 metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
                 metadata_token_sequences: HashMap::new(),
@@ -1135,10 +1151,10 @@ impl Workspace {
     }
 
     fn automatic_display_name_for_cwd(&self, cwd: &std::path::Path) -> String {
-        if cwd == self.cached_identity_cwd {
+        if self.label_parent_segments == 0 && cwd == self.cached_identity_cwd {
             self.cached_auto_label.clone()
         } else {
-            fallback_label_from_cwd(cwd)
+            derive_label_from_cwd(cwd, self.label_parent_segments)
         }
     }
 
@@ -1276,6 +1292,7 @@ impl Workspace {
             cached_git_branch: git_branch(&identity_cwd),
             cached_git_ahead_behind: None,
             cached_git_space: None,
+            label_parent_segments: 0,
             worktree_space: None,
             metadata_tokens: crate::metadata_tokens::MetadataTokens::default(),
             metadata_token_sequences: HashMap::new(),
@@ -1665,6 +1682,7 @@ mod tests {
             events,
             render_notify,
             render_dirty,
+            0,
         )
         .expect("create workspace");
 

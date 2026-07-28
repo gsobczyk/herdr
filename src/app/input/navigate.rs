@@ -2059,7 +2059,7 @@ mod tests {
     async fn new_workspace_key_opens_prefilled_prompt_and_preserves_captured_cwd() {
         let cwd = unique_temp_path("workspace-name-suggestion");
         std::fs::create_dir_all(&cwd).unwrap();
-        let suggested_name = crate::workspace::derive_label_from_cwd(&cwd);
+        let suggested_name = crate::workspace::derive_label_from_cwd(&cwd, 0);
         let mut app = app_with_test_workspaces(&["test"]);
         app.state.new_terminal_cwd =
             crate::config::NewTerminalCwdConfig::Path(cwd.display().to_string());
@@ -3246,6 +3246,7 @@ navigate_pane_down = "ctrl+j"
             app.event_tx.clone(),
             app.render_notify.clone(),
             app.render_dirty.clone(),
+            app.state.workspace_label_parent_segments,
         )
         .expect("workspace should spawn");
         let root_pane = workspace.tabs[0].root_pane;

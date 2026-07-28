@@ -28,15 +28,16 @@ pub fn derive_label_from_cwd(cwd: &Path, parent_segments: usize) -> String {
         }
     }
 
-    fallback_label_from_cwd(cwd)
+    if is_home_dir(cwd) {
+        return "~".to_string();
+    }
+
+    label_with_parent_segments(cwd, parent_segments).unwrap_or_else(|| cwd.display().to_string())
 }
 
 pub fn fallback_label_from_cwd(cwd: &Path) -> String {
-    if let Ok(home) = std::env::var("HOME") {
-        let home = Path::new(&home);
-        if cwd == home {
-            return "~".to_string();
-        }
+    if is_home_dir(cwd) {
+        return "~".to_string();
     }
 
     cwd.file_name()
@@ -44,6 +45,12 @@ pub fn fallback_label_from_cwd(cwd: &Path) -> String {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| cwd.display().to_string())
+}
+
+fn is_home_dir(cwd: &Path) -> bool {
+    std::env::var("HOME")
+        .map(|home| cwd == Path::new(&home))
+        .unwrap_or(false)
 }
 
 fn label_with_parent_segments(path: &Path, parent_segments: usize) -> Option<String> {
@@ -505,6 +512,27 @@ mod tests {
     #[test]
     fn derive_label_parent_segments_clamp_at_filesystem_root() {
         assert_eq!(derive_label_from_cwd(Path::new("/"), 5), "/");
+    }
+
+    #[test]
+    fn derive_label_includes_parent_segments_without_git_repo() {
+        let root = temp_test_dir("label-parent-non-git");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let dir_name = nested.file_name().and_then(|name| name.to_str()).unwrap();
+        let parent_name = nested
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap();
+
+        assert_eq!(
+            derive_label_from_cwd(&nested, 1),
+            format!("{parent_name}/{dir_name}")
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

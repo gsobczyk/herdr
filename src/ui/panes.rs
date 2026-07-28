@@ -689,6 +689,8 @@ fn render_pane_border_titles(app: &AppState, ws: &crate::workspace::Workspace, f
             style = style.add_modifier(Modifier::BOLD);
         }
 
+        let layout = pane_action_layout(info, ws.zoomed);
+
         if let Some(title) = ws
             .pane_state(info.id)
             .and_then(|pane| app.terminals.get(&pane.attached_terminal_id))
@@ -702,6 +704,10 @@ fn render_pane_border_titles(app: &AppState, ws: &crate::workspace::Workspace, f
                 .saturating_add(info.rect.width)
                 .saturating_sub(1)
                 .min(area.x.saturating_add(area.width));
+            let end_x = match &layout {
+                Some(layout) => end_x.min(layout.zoom_rect.x.saturating_sub(1)),
+                None => end_x,
+            };
             if start_x < end_x {
                 buf.set_stringn(
                     start_x,
@@ -713,7 +719,7 @@ fn render_pane_border_titles(app: &AppState, ws: &crate::workspace::Workspace, f
             }
         }
 
-        if let Some(layout) = pane_action_layout(info, ws.zoomed) {
+        if let Some(layout) = layout {
             buf.set_stringn(
                 layout.zoom_rect.x,
                 y,
@@ -1072,12 +1078,12 @@ mod tests {
     fn pane_border_renderer_places_adjacent_cjk_by_display_width() {
         let mut app = AppState::test_new();
         app.mode = Mode::Terminal;
-        app.view.terminal_area = Rect::new(0, 0, 12, 3);
+        app.view.terminal_area = Rect::new(0, 0, 24, 3);
         let ws = Workspace::test_new("test");
         let pane_id = ws.tabs[0].root_pane;
         app.view.pane_infos = vec![PaneInfo {
             id: pane_id,
-            rect: Rect::new(0, 0, 12, 3),
+            rect: Rect::new(0, 0, 24, 3),
             inner_rect: Rect::default(),
             scrollbar_rect: None,
             borders: Borders::ALL,
@@ -1090,7 +1096,7 @@ mod tests {
         app.terminals.insert(terminal_id, terminal_state);
 
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(12, 3)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(24, 3)).unwrap();
         terminal
             .draw(|frame| render_pane_borders(&app, &ws, frame))
             .unwrap();

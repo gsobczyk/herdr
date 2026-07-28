@@ -40,7 +40,7 @@ use self::navigator::render_navigator_overlay;
 pub(crate) use self::onboarding::onboarding_welcome_continue_rect;
 use self::onboarding::render_onboarding_overlay;
 pub(crate) use self::panes::popup_pane_rects;
-use self::panes::{render_empty, render_popup_pane, resize_popup_pane};
+use self::panes::{pane_action_hit_areas, render_empty, render_popup_pane, resize_popup_pane};
 pub(crate) use self::release_notes::{
     product_announcement_display_lines, release_notes_close_button_rect,
     release_notes_display_lines, release_notes_wrapped_line_count, PRODUCT_ANNOUNCEMENT_MODAL_SIZE,
@@ -286,6 +286,12 @@ fn compute_view_internal(
         resize_panes,
         cell_size,
     );
+    let pane_action_hit_areas = pane_action_hit_areas(
+        &pane_infos,
+        app.active
+            .and_then(|ws_idx| app.workspaces.get(ws_idx))
+            .is_some_and(|ws| ws.zoomed),
+    );
     if resize_panes {
         resize_background_tab_panes_for_desktop(app, terminal_runtimes, main_area, cell_size);
         resize_popup_pane(app, terminal_runtimes, terminal_area, cell_size);
@@ -317,6 +323,7 @@ fn compute_view_internal(
         mobile_header_rect: Rect::default(),
         mobile_menu_hit_area: Rect::default(),
         toast_hit_area,
+        pane_action_hit_areas,
         pane_infos,
         split_borders,
     };
@@ -355,6 +362,12 @@ fn compute_mobile_view(
         resize_panes,
         cell_size,
     );
+    let pane_action_hit_areas = pane_action_hit_areas(
+        &pane_infos,
+        app.active
+            .and_then(|ws_idx| app.workspaces.get(ws_idx))
+            .is_some_and(|ws| ws.zoomed),
+    );
     if resize_panes {
         resize_background_tab_panes_to_area(app, terminal_runtimes, terminal_area, cell_size);
         resize_popup_pane(app, terminal_runtimes, terminal_area, cell_size);
@@ -380,6 +393,7 @@ fn compute_mobile_view(
         mobile_header_rect: header_rect,
         mobile_menu_hit_area: header_hits.menu,
         toast_hit_area,
+        pane_action_hit_areas,
         pane_infos,
         split_borders,
     };

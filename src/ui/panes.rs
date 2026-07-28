@@ -7,11 +7,11 @@ use ratatui::{
 };
 
 use super::scrollbar::{render_pane_scrollbar, should_show_scrollbar};
-#[cfg(test)]
 use super::text::display_width;
 use super::text::truncate_end;
 use super::widgets::panel_contrast_fg;
 use crate::app::state::Palette;
+use crate::app::state::PaneActionHitArea;
 use crate::app::{AppState, Mode};
 use crate::layout::PaneInfo;
 use crate::popup_size::resolve_popup_geometry;
@@ -29,6 +29,67 @@ fn pane_border_title(label: &str, pane_width: u16, _focused: bool) -> Option<Str
     }
     let max_label_width = pane_width.saturating_sub(4) as usize;
     Some(format!(" {} ", truncate_end(label, max_label_width)))
+}
+
+const PANE_ICON_RESTORE: &str = "🗗";
+const PANE_ICON_MAXIMIZE: &str = "🗖";
+const PANE_ICON_CLOSE: &str = "✕";
+
+struct PaneActionLayout {
+    zoom_rect: Rect,
+    close_rect: Rect,
+    zoom_icon: &'static str,
+}
+
+fn pane_action_layout(info: &PaneInfo, zoomed: bool) -> Option<PaneActionLayout> {
+    if !info.borders.contains(Borders::TOP) || info.rect.width <= 6 {
+        return None;
+    }
+
+    let zoom_icon = if zoomed {
+        PANE_ICON_RESTORE
+    } else {
+        PANE_ICON_MAXIMIZE
+    };
+    let zoom_w = display_width(zoom_icon).max(1).min(u16::MAX as usize) as u16;
+    let close_w = display_width(PANE_ICON_CLOSE).max(1).min(u16::MAX as usize) as u16;
+    let gap_w: u16 = 1;
+    let required = zoom_w.saturating_add(gap_w).saturating_add(close_w);
+    let available = info.rect.width.saturating_sub(2);
+    if available < required {
+        return None;
+    }
+
+    let y = info.rect.y;
+    let right_inner = info
+        .rect
+        .x
+        .saturating_add(info.rect.width)
+        .saturating_sub(2);
+    let close_x = right_inner.saturating_add(1).saturating_sub(close_w);
+    let zoom_x = close_x.saturating_sub(gap_w).saturating_sub(zoom_w);
+
+    Some(PaneActionLayout {
+        zoom_rect: Rect::new(zoom_x, y, zoom_w, 1),
+        close_rect: Rect::new(close_x, y, close_w, 1),
+        zoom_icon,
+    })
+}
+
+pub(crate) fn pane_action_hit_areas(
+    pane_infos: &[PaneInfo],
+    zoomed: bool,
+) -> Vec<PaneActionHitArea> {
+    pane_infos
+        .iter()
+        .filter_map(|info| {
+            pane_action_layout(info, zoomed).map(|layout| PaneActionHitArea {
+                pane_id: info.id,
+                zoom_rect: layout.zoom_rect,
+                close_rect: layout.close_rect,
+            })
+        })
+        .collect()
 }
 
 fn stable_terminal_inner_rect(pane_inner: Rect) -> Rect {
@@ -655,6 +716,23 @@ fn render_pane_border_titles(
             end_x.saturating_sub(start_x) as usize,
             style,
         );
+
+        if let Some(layout) = pane_action_layout(info, ws.zoomed) {
+            buf.set_stringn(
+                layout.zoom_rect.x,
+                y,
+                layout.zoom_icon,
+                layout.zoom_rect.width as usize,
+                style,
+            );
+            buf.set_stringn(
+                layout.close_rect.x,
+                y,
+                PANE_ICON_CLOSE,
+                layout.close_rect.width as usize,
+                style,
+            );
+        }
     }
 }
 
@@ -1095,6 +1173,27 @@ mod tests {
         assert_eq!(left.rect.x + left.rect.width, right.rect.x);
         assert_eq!(left.borders, Borders::ALL);
         assert_eq!(right.borders, Borders::ALL);
+    }
+
+    #[test]
+    fn pane_action_hit_areas_are_placed_at_top_right() {
+        let pane_id = PaneId::from_raw(1);
+        let infos = vec![PaneInfo {
+            id: pane_id,
+            rect: Rect::new(0, 0, 20, 5),
+            inner_rect: Rect::new(1, 1, 18, 3),
+            scrollbar_rect: None,
+            borders: Borders::ALL,
+            is_focused: true,
+        }];
+
+        let hit_areas = pane_action_hit_areas(&infos, false);
+        let first = hit_areas.first().expect("pane action hit area");
+        assert_eq!(first.pane_id, pane_id);
+        assert_eq!(first.zoom_rect.y, 0);
+        assert_eq!(first.close_rect.y, 0);
+        assert!(first.zoom_rect.x < first.close_rect.x);
+        assert!(first.close_rect.x >= 17);
     }
 
     #[test]

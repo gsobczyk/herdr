@@ -2,5 +2,7 @@ init = [
   "curl https://sh.rustup.rs -sSf | sh -s -- -y",
   "bash -lc 'source $HOME/.cargo/env && rustup default stable'",
   "bash -lc 'source $HOME/.cargo/env && cargo install just'",
+  "bash -lc 'set -e; case \"$(uname -m)\" in x86_64) ZARCH=x86_64;; aarch64|arm64) ZARCH=aarch64;; *) echo \"unsupported arch: $(uname -m)\" >&2; exit 1;; esac; curl -fsSL -o /tmp/zig.tar.xz \"https://ziglang.org/download/0.15.2/zig-${ZARCH}-linux-0.15.2.tar.xz\"; mkdir -p $HOME/.local/zig-0.15.2; tar -xJf /tmp/zig.tar.xz -C $HOME/.local/zig-0.15.2 --strip-components=1; rm /tmp/zig.tar.xz'",
+  "bash -lc 'mkdir -p $HOME/.cargo/bin && ln -sf $HOME/.local/zig-0.15.2/zig $HOME/.cargo/bin/zig'",
 ]
 init_wait = false

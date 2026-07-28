@@ -31,14 +31,14 @@ fn pane_border_title(label: &str, pane_width: u16, _focused: bool) -> Option<Str
     Some(format!(" {} ", truncate_end(label, max_label_width)))
 }
 
-const PANE_ICON_RESTORE: &str = "🗗";
-const PANE_ICON_MAXIMIZE: &str = "🗖";
-const PANE_ICON_CLOSE: &str = "✕";
+const PANE_ACTION_RESTORE: &str = "[🗗]";
+const PANE_ACTION_MAXIMIZE: &str = "[🗖]";
+const PANE_ACTION_CLOSE: &str = "[✕]";
 
 struct PaneActionLayout {
     zoom_rect: Rect,
     close_rect: Rect,
-    zoom_icon: &'static str,
+    zoom_label: &'static str,
 }
 
 fn pane_action_layout(info: &PaneInfo, zoomed: bool) -> Option<PaneActionLayout> {
@@ -46,13 +46,13 @@ fn pane_action_layout(info: &PaneInfo, zoomed: bool) -> Option<PaneActionLayout>
         return None;
     }
 
-    let zoom_icon = if zoomed {
-        PANE_ICON_RESTORE
+    let zoom_label = if zoomed {
+        PANE_ACTION_RESTORE
     } else {
-        PANE_ICON_MAXIMIZE
+        PANE_ACTION_MAXIMIZE
     };
-    let zoom_w = display_width(zoom_icon).max(1).min(u16::MAX as usize) as u16;
-    let close_w = display_width(PANE_ICON_CLOSE).max(1).min(u16::MAX as usize) as u16;
+    let zoom_w = display_width(zoom_label).max(1).min(u16::MAX as usize) as u16;
+    let close_w = display_width(PANE_ACTION_CLOSE).max(1).min(u16::MAX as usize) as u16;
     let gap_w: u16 = 1;
     let required = zoom_w.saturating_add(gap_w).saturating_add(close_w);
     let available = info.rect.width.saturating_sub(2);
@@ -72,7 +72,7 @@ fn pane_action_layout(info: &PaneInfo, zoomed: bool) -> Option<PaneActionLayout>
     Some(PaneActionLayout {
         zoom_rect: Rect::new(zoom_x, y, zoom_w, 1),
         close_rect: Rect::new(close_x, y, close_w, 1),
-        zoom_icon,
+        zoom_label,
     })
 }
 
@@ -678,26 +678,8 @@ fn render_pane_border_titles(
         if !info.borders.contains(Borders::TOP) || info.rect.width <= 4 {
             continue;
         }
-        let Some(title) = ws
-            .pane_state(info.id)
-            .and_then(|pane| app.terminals.get(&pane.attached_terminal_id))
-            .and_then(|terminal| terminal.border_label(app.show_agent_labels_on_pane_borders))
-            .and_then(|label| pane_border_title(&label, info.rect.width, info.is_focused))
-        else {
-            continue;
-        };
         let y = info.rect.y;
         if y < area.y || y >= area.y.saturating_add(area.height) {
-            continue;
-        }
-        let start_x = info.rect.x.saturating_add(1);
-        let end_x = info
-            .rect
-            .x
-            .saturating_add(info.rect.width)
-            .saturating_sub(1)
-            .min(area.x.saturating_add(area.width));
-        if start_x >= end_x {
             continue;
         }
         let color = if info.is_focused {
@@ -709,26 +691,43 @@ fn render_pane_border_titles(
         if info.is_focused {
             style = style.add_modifier(Modifier::BOLD);
         }
-        buf.set_stringn(
-            start_x,
-            y,
-            title,
-            end_x.saturating_sub(start_x) as usize,
-            style,
-        );
+
+        if let Some(title) = ws
+            .pane_state(info.id)
+            .and_then(|pane| app.terminals.get(&pane.attached_terminal_id))
+            .and_then(|terminal| terminal.border_label(app.show_agent_labels_on_pane_borders))
+            .and_then(|label| pane_border_title(&label, info.rect.width, info.is_focused))
+        {
+            let start_x = info.rect.x.saturating_add(1);
+            let end_x = info
+                .rect
+                .x
+                .saturating_add(info.rect.width)
+                .saturating_sub(1)
+                .min(area.x.saturating_add(area.width));
+            if start_x < end_x {
+                buf.set_stringn(
+                    start_x,
+                    y,
+                    title,
+                    end_x.saturating_sub(start_x) as usize,
+                    style,
+                );
+            }
+        }
 
         if let Some(layout) = pane_action_layout(info, ws.zoomed) {
             buf.set_stringn(
                 layout.zoom_rect.x,
                 y,
-                layout.zoom_icon,
+                layout.zoom_label,
                 layout.zoom_rect.width as usize,
                 style,
             );
             buf.set_stringn(
                 layout.close_rect.x,
                 y,
-                PANE_ICON_CLOSE,
+                PANE_ACTION_CLOSE,
                 layout.close_rect.width as usize,
                 style,
             );
@@ -1193,7 +1192,43 @@ mod tests {
         assert_eq!(first.zoom_rect.y, 0);
         assert_eq!(first.close_rect.y, 0);
         assert!(first.zoom_rect.x < first.close_rect.x);
-        assert!(first.close_rect.x >= 17);
+        assert_eq!(first.close_rect.x + first.close_rect.width, 19);
+        assert_eq!(first.close_rect.x, first.zoom_rect.x + first.zoom_rect.width + 1);
+    }
+
+    #[test]
+    fn pane_action_icons_render_without_border_label() {
+        let mut app = AppState::test_new();
+        app.mode = Mode::Terminal;
+        app.view.pane_infos = vec![PaneInfo {
+            id: PaneId::from_raw(1),
+            rect: Rect::new(0, 0, 20, 5),
+            inner_rect: Rect::new(1, 1, 18, 3),
+            scrollbar_rect: None,
+            borders: Borders::ALL,
+            is_focused: true,
+        }];
+        let ws = Workspace::test_new("test");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 5)).unwrap();
+
+        terminal
+            .draw(|frame| render_pane_borders(&app, &ws, frame))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let layout = pane_action_layout(&app.view.pane_infos[0], ws.zoomed).expect("layout");
+        assert_eq!(buffer[(layout.zoom_rect.x, 0)].symbol(), "[");
+        assert_eq!(
+            buffer[(layout.zoom_rect.x + layout.zoom_rect.width - 1, 0)].symbol(),
+            "]"
+        );
+        assert_eq!(buffer[(layout.close_rect.x, 0)].symbol(), "[");
+        assert_eq!(
+            buffer[(layout.close_rect.x + layout.close_rect.width - 1, 0)].symbol(),
+            "]"
+        );
+        assert_eq!(buffer[(layout.close_rect.x + 1, 0)].symbol(), "✕");
     }
 
     #[test]

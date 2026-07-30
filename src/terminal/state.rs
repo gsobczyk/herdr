@@ -1990,8 +1990,9 @@ impl TerminalState {
     }
 
     pub fn border_label(&self, show_agent_labels: bool) -> Option<String> {
-        self.effective_title().or_else(|| {
-            self.manual_label.clone().or_else(|| {
+        self.effective_title()
+            .or_else(|| self.manual_label.clone())
+            .or_else(|| {
                 show_agent_labels
                     .then(|| {
                         self.effective_display_agent()
@@ -1999,7 +2000,7 @@ impl TerminalState {
                     })
                     .flatten()
             })
-        })
+            .or_else(|| self.terminal_title_stripped())
     }
 
     fn recompute_effective_state(
@@ -3766,6 +3767,28 @@ mod tests {
 
         terminal.set_manual_label("reviewer".into());
         terminal.clear_manual_label();
+        assert_eq!(terminal.border_label(true).as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn border_label_falls_back_to_terminal_title_for_unrecognized_program() {
+        let mut terminal = test_terminal();
+        terminal.set_terminal_title(Some("k9s".into()));
+
+        assert_eq!(terminal.border_label(false).as_deref(), Some("k9s"));
+        assert_eq!(terminal.border_label(true).as_deref(), Some("k9s"));
+    }
+
+    #[test]
+    fn border_label_prefers_detected_agent_over_terminal_title() {
+        let mut terminal = test_terminal();
+        terminal.set_terminal_title(Some("some-window-title".into()));
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+
+        assert_eq!(
+            terminal.border_label(false).as_deref(),
+            Some("some-window-title")
+        );
         assert_eq!(terminal.border_label(true).as_deref(), Some("claude"));
     }
 

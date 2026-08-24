@@ -96,7 +96,7 @@ pub(crate) use self::{
     },
     panes::{apply_pane_chrome, pane_inner_rect, pane_is_scrolled_back},
     tab_surface::{tab_surface_cursor, tab_surface_hyperlinks, TabSurfaceView},
-    tabs::compute_tab_bar_view,
+    tabs::{compute_tab_bar_view, tab_bar_content_area},
     widgets::{centered_popup_rect, modal_stack_areas},
 };
 use crate::app::state::ViewLayout;
@@ -104,15 +104,6 @@ use crate::app::{AppState, Mode};
 use crate::terminal::TerminalRuntimeRegistry;
 
 const COLLAPSED_WIDTH: u16 = 4; // num + space + dot + separator
-
-// Braille spinner frames — smooth rotation
-const SPINNERS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-/// Map spinner_tick (incremented every frame at ~60fps) to a spinner frame.
-/// We want ~8 updates/sec so divide by 8.
-pub(super) fn spinner_frame(tick: u32) -> &'static str {
-    SPINNERS[(tick as usize / 8) % SPINNERS.len()]
-}
 
 /// Compute view geometry and reconcile pane sizes.
 /// Called before render to separate mutation from drawing.
@@ -204,9 +195,18 @@ fn desktop_tab_bar_and_terminal_area(
 ) -> (Rect, Rect) {
     let hide_single_tab_bar = app.hide_tab_bar_when_single_tab && ws.tabs.len() == 1;
     if !hide_single_tab_bar && main_area.height > 1 {
-        let [tab_bar_rect, terminal_area] =
-            Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main_area);
-        (tab_bar_rect, terminal_area)
+        match app.tab_bar_position {
+            crate::config::TabBarPositionConfig::Top => {
+                let [tab_bar_rect, terminal_area] =
+                    Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(main_area);
+                (tab_bar_rect, terminal_area)
+            }
+            crate::config::TabBarPositionConfig::Bottom => {
+                let [terminal_area, tab_bar_rect] =
+                    Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(main_area);
+                (tab_bar_rect, terminal_area)
+            }
+        }
     } else {
         (Rect::default(), main_area)
     }
@@ -267,7 +267,7 @@ fn compute_view_internal(
         .map(|ws| {
             compute_tab_bar_view(
                 ws,
-                tab_bar_rect,
+                tab_bar_content_area(app, tab_bar_rect),
                 app.tab_scroll,
                 app.tab_scroll_follow_active,
                 app.mouse_capture,
@@ -415,7 +415,7 @@ pub fn render_with_runtime_registry(
     let tab_bar_area = app.view.tab_bar_rect;
     let terminal_area = app.view.terminal_area;
 
-    render_working_animation(app, terminal_runtimes, frame);
+    render_navigation_chrome(app, terminal_runtimes, frame);
     if app.view.layout != ViewLayout::Mobile {
         render_tab_bar(app, frame, tab_bar_area);
     }
@@ -433,6 +433,15 @@ pub fn render_with_runtime_registry(
     render_notifications(app, frame, terminal_area);
     render_popup_pane(app, terminal_runtimes, frame, terminal_area);
 
+    let mode_bar_area = if app.view.layout == ViewLayout::Desktop
+        && app.tab_bar_position == crate::config::TabBarPositionConfig::Bottom
+        && tab_bar_area.height > 0
+    {
+        tab_bar_area
+    } else {
+        terminal_area
+    };
+
     match app.mode {
         Mode::Onboarding => render_onboarding_overlay(app, frame, frame.area()),
         Mode::ReleaseNotes => render_release_notes_overlay(app, frame, frame.area()),
@@ -440,10 +449,10 @@ pub fn render_with_runtime_registry(
         Mode::Navigate if app.view.layout == ViewLayout::Mobile => {
             render_mobile_panel(app, terminal_runtimes, frame, frame.area())
         }
-        Mode::Navigate => render_navigate_overlay(app, frame, terminal_area),
-        Mode::Prefix => render_prefix_overlay(app, frame, terminal_area),
-        Mode::Copy => render_copy_mode_overlay(app, frame, terminal_area),
-        Mode::Resize => render_resize_overlay(app, frame, terminal_area),
+        Mode::Navigate => render_navigate_overlay(app, frame, mode_bar_area),
+        Mode::Prefix => render_prefix_overlay(app, frame, mode_bar_area),
+        Mode::Copy => render_copy_mode_overlay(app, frame, mode_bar_area),
+        Mode::Resize => render_resize_overlay(app, frame, mode_bar_area),
         Mode::ConfirmClose => {
             render_confirm_close_overlay(app, terminal_runtimes, frame, terminal_area)
         }
@@ -466,7 +475,7 @@ pub fn render_with_runtime_registry(
     }
 }
 
-pub(crate) fn render_working_animation(
+fn render_navigation_chrome(
     app: &AppState,
     terminal_runtimes: &TerminalRuntimeRegistry,
     frame: &mut Frame,
@@ -817,6 +826,35 @@ mod tests {
     }
 
     #[test]
+    fn desktop_tab_bar_position_controls_geometry_and_mode_bar_placement() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Prefix;
+
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        assert_eq!(app.view.tab_bar_rect, Rect::new(26, 0, 54, 1));
+        assert_eq!(app.view.terminal_area, Rect::new(26, 1, 54, 19));
+
+        app.tab_bar_position = crate::config::TabBarPositionConfig::Bottom;
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        assert_eq!(app.view.terminal_area, Rect::new(26, 0, 54, 19));
+        assert_eq!(app.view.tab_bar_rect, Rect::new(26, 19, 54, 1));
+        assert!(app.view.tab_hit_areas.iter().all(|rect| rect.y == 19));
+        assert_eq!(app.view.new_tab_hit_area.y, 19);
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let mode_row = buffer_row_text(
+            terminal.backend().buffer(),
+            app.view.tab_bar_rect,
+            app.view.tab_bar_rect.y,
+        );
+        assert!(mode_row.contains("PREFIX"), "{mode_row}");
+    }
+
+    #[test]
     fn hide_tab_bar_when_single_tab_toggles_geometry_with_tab_count() {
         let mut app = crate::app::state::AppState::test_new();
         app.hide_tab_bar_when_single_tab = true;
@@ -848,6 +886,30 @@ mod tests {
         assert_eq!(app.view.tab_bar_rect, Rect::default());
         assert!(app.view.tab_hit_areas.is_empty());
         assert_eq!(app.view.new_tab_hit_area, Rect::default());
+    }
+
+    #[test]
+    fn bottom_tab_bar_still_hides_when_single_tab() {
+        let mut app = crate::app::state::AppState::test_new();
+        app.hide_tab_bar_when_single_tab = true;
+        app.tab_bar_position = crate::config::TabBarPositionConfig::Bottom;
+        app.workspaces = vec![Workspace::test_new("one")];
+        app.active = Some(0);
+        app.selected = 0;
+        app.mode = Mode::Prefix;
+
+        compute_view(&mut app, Rect::new(0, 0, 80, 20));
+        assert_eq!(app.view.tab_bar_rect, Rect::default());
+        assert_eq!(app.view.terminal_area, Rect::new(26, 0, 54, 20));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| render(&app, frame)).unwrap();
+        let mode_row = buffer_row_text(
+            terminal.backend().buffer(),
+            app.view.terminal_area,
+            app.view.terminal_area.y + app.view.terminal_area.height - 1,
+        );
+        assert!(mode_row.contains("PREFIX"), "{mode_row}");
     }
 
     #[tokio::test]
@@ -1024,7 +1086,7 @@ mod tests {
         let active_row = ws_area.y + 1;
         let active_style = buffer[(ws_area.x, active_row)].style();
 
-        assert_eq!(active_style.bg, Some(app.palette.surface_dim));
+        assert_eq!(active_style.bg, Some(app.palette.active_row_bg));
     }
 
     #[test]

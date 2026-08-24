@@ -38,6 +38,7 @@ fn modified_url_click_modifier_matches_terminal_mouse_reporting() {
 
 mod clipboard;
 mod copy_mode;
+mod lease;
 mod modal;
 mod mouse;
 mod navigate;
@@ -48,6 +49,7 @@ mod sidebar;
 mod terminal;
 
 pub(crate) use self::{
+    lease::{ConsumedInputLease, ForwardedInputLease, InputLeaseKey, InputLeaseTable, RepeatPlan},
     modal::{
         handle_global_menu_key, handle_keybind_help_key, handle_navigator_key,
         insert_keybind_help_query_text, insert_navigator_search_text, insert_rename_input_text,
@@ -119,6 +121,66 @@ impl App {
             },
         }
         None
+    }
+
+    pub(crate) fn handle_text_commit_headless(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.state.popup_pane.is_some() {
+            if let Some(runtime) = self.popup_runtime() {
+                let _ = runtime.try_send_bytes(Bytes::copy_from_slice(text.as_bytes()));
+            } else {
+                self.close_popup_pane();
+            }
+            return;
+        }
+        if self.state.mode != Mode::Terminal {
+            self.paste_into_active_text_input(text);
+            return;
+        }
+
+        self.state.clear_selection();
+        self.selection_autoscroll_deadline = None;
+        self.state.update_dismissed = true;
+        if let Some(ws_idx) = self.state.active {
+            if let Some(runtime) = self
+                .state
+                .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
+            {
+                let _ = runtime.try_send_bytes(Bytes::copy_from_slice(text.as_bytes()));
+            }
+        }
+    }
+
+    pub(super) async fn handle_text_commit(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        if self.state.popup_pane.is_some() {
+            if let Some(runtime) = self.popup_runtime() {
+                let _ = runtime.send_bytes(Bytes::from(text)).await;
+            } else {
+                self.close_popup_pane();
+            }
+            return;
+        }
+        if self.state.mode != Mode::Terminal {
+            self.paste_into_active_text_input(&text);
+            return;
+        }
+
+        self.state.clear_selection();
+        self.selection_autoscroll_deadline = None;
+        self.state.update_dismissed = true;
+        if let Some(ws_idx) = self.state.active {
+            if let Some(runtime) = self
+                .state
+                .focused_runtime_in_workspace(&self.terminal_runtimes, ws_idx)
+            {
+                let _ = runtime.send_bytes(Bytes::from(text)).await;
+            }
+        }
     }
 
     pub(super) async fn handle_paste(&mut self, text: String) {
@@ -330,25 +392,25 @@ impl App {
         let previous_agent_panel_sort = self.state.agent_panel_sort;
         let previous_settings_section = self.state.settings.section;
         if !handled_pane_double_click {
-            if let Some(action) = self.state.handle_mouse(&mut self.terminal_runtimes, mouse) {
+            if let Some(action) =
+                self.state
+                    .handle_mouse(&mut self.terminal_runtimes, source_id, mouse)
+            {
                 match action {
                     MouseAction::NewWorkspace => {
                         self.begin_tui_workspace_create("tui.mouse.workspace.create")
                     }
                     MouseAction::Settings(action) => match action {
                         SettingsAction::SaveTheme(name) => self.save_theme(&name),
+                        SettingsAction::SaveStatusIndicators(style) => {
+                            self.save_status_indicators(style)
+                        }
                         SettingsAction::SaveSound(enabled) => self.save_sound(enabled),
                         SettingsAction::SaveToastDelivery(delivery) => {
                             self.save_toast_delivery(delivery)
                         }
                         SettingsAction::SaveAgentBorderLabels(enabled) => {
                             self.save_agent_border_labels(enabled)
-                        }
-                        SettingsAction::SavePaneHistory(enabled) => {
-                            self.save_pane_history_persistence(enabled)
-                        }
-                        SettingsAction::SaveSwitchAsciiInputSourceInPrefix(enabled) => {
-                            self.save_switch_ascii_input_source_in_prefix(enabled)
                         }
                         SettingsAction::InstallRecommendedIntegrations => {
                             self.install_recommended_integrations()
@@ -442,15 +504,17 @@ impl App {
             self.close_popup_pane();
             return;
         };
-        let column = mouse.column.saturating_sub(inner.x);
-        let row = mouse.row.saturating_sub(inner.y);
+        let position = crate::input::mouse::Position::Cell {
+            column: mouse.column.saturating_sub(inner.x),
+            row: mouse.row.saturating_sub(inner.y),
+        };
         let bytes = match mouse.kind {
             MouseEventKind::ScrollUp
             | MouseEventKind::ScrollDown
             | MouseEventKind::ScrollLeft
             | MouseEventKind::ScrollRight => match rt.wheel_routing() {
                 Some(crate::pane::WheelRouting::MouseReport) => {
-                    rt.encode_mouse_wheel(mouse.kind, column, row, mouse.modifiers)
+                    rt.encode_mouse_wheel(mouse.kind, position, mouse.modifiers)
                 }
                 Some(crate::pane::WheelRouting::AlternateScroll) => {
                     rt.encode_alternate_scroll(mouse.kind)
@@ -466,11 +530,9 @@ impl App {
                 }
             },
             MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
-                rt.encode_mouse_button(mouse.kind, column, row, mouse.modifiers)
+                rt.encode_mouse_button(mouse.kind, position, mouse.modifiers)
             }
-            MouseEventKind::Moved => {
-                rt.encode_mouse_motion(mouse.kind, column, row, mouse.modifiers)
-            }
+            MouseEventKind::Moved => rt.encode_mouse_motion(mouse.kind, position, mouse.modifiers),
         };
         let Some(bytes) = bytes else {
             return;
@@ -513,6 +575,15 @@ impl App {
         source_id: super::InputSourceId,
         mouse: MouseEvent,
     ) -> bool {
+        self.handle_modified_url_click_with(source_id, mouse, crate::platform::open_url)
+    }
+
+    fn handle_modified_url_click_with(
+        &mut self,
+        source_id: super::InputSourceId,
+        mouse: MouseEvent,
+        open_url: impl FnOnce(&str) -> std::io::Result<Option<std::process::Child>>,
+    ) -> bool {
         if self.state.mode != Mode::Terminal
             || !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
             || !mouse.modifiers.contains(modified_url_click_modifier())
@@ -541,8 +612,12 @@ impl App {
                 tracing::warn!(err = %err, url = %url, "failed to invoke plugin link handler");
             }
         }
-        if let Err(err) = crate::platform::open_url(&url) {
-            tracing::warn!(err = %err, url = %url, "failed to open pane URL");
+        match open_url(&url) {
+            Ok(Some(child)) => self.detached_process_children.push(child),
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(err = %err, url = %url, "failed to open pane URL");
+            }
         }
         true
     }
@@ -724,6 +799,7 @@ impl AppState {
                 cwd,
                 self.pane_scrollback_limit_bytes,
                 self.host_terminal_theme,
+                self.host_terminal_appearance,
                 crate::pane::PaneShellConfig::new(&self.default_shell, self.shell_mode),
                 Vec::new(),
             ) {
@@ -840,6 +916,18 @@ fn wait_for_file(path: &std::path::Path) -> String {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     panic!("timed out waiting for {}", path.display());
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+async fn wait_for_detached_process_reap(app: &mut App, pid: u32) -> bool {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    while crate::platform::process_exists(pid) && tokio::time::Instant::now() < deadline {
+        app.reap_finished_detached_processes();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    app.reap_finished_detached_processes();
+    !crate::platform::process_exists(pid)
 }
 
 #[cfg(test)]

@@ -1,4 +1,7 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+const MAX_GIT_REF_FILE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitSpaceMetadata {
@@ -18,24 +21,25 @@ pub struct GitWorktreeInfo {
     pub is_linked_worktree: bool,
 }
 
-/// Derive a workspace label from `cwd`. `parent_segments` prepends that many
-/// ancestor directory names (joined with `/`), e.g. `parent_segments: 1` turns
-/// `herdr` into `other/herdr`.
-pub fn derive_label_from_cwd(cwd: &Path, parent_segments: usize) -> String {
-    if let Some(repo_root) = git_repo_root(cwd) {
-        if parent_segments == 0 {
-            return automatic_workspace_label(cwd, &repo_root);
-        }
-        if let Some(label) = label_with_parent_segments(&repo_root, parent_segments) {
-            return label;
-        }
-    }
+/// Ancestor directory segments prepended to auto-derived workspace labels,
+/// mirrored from `ui.workspace_label_parent_segments`.
+// ponytail: process-global config mirror; thread it through Workspace only if a
+// per-workspace override is ever needed.
+static LABEL_PARENT_SEGMENTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
-    if is_home_dir(cwd) {
-        return "~".to_string();
-    }
+pub fn set_label_parent_segments(segments: usize) {
+    LABEL_PARENT_SEGMENTS.store(segments, std::sync::atomic::Ordering::Relaxed);
+}
 
-    label_with_parent_segments(cwd, parent_segments).unwrap_or_else(|| cwd.display().to_string())
+fn label_parent_segments() -> usize {
+    LABEL_PARENT_SEGMENTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn derive_label_from_cwd(cwd: &Path) -> String {
+    git_repo_root(cwd)
+        .map(|repo_root| automatic_workspace_label(cwd, &repo_root))
+        .unwrap_or_else(|| fallback_label_from_cwd(cwd))
 }
 
 pub fn fallback_label_from_cwd(cwd: &Path) -> String {
@@ -43,11 +47,7 @@ pub fn fallback_label_from_cwd(cwd: &Path) -> String {
         return "~".to_string();
     }
 
-    cwd.file_name()
-        .and_then(|n| n.to_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| cwd.display().to_string())
+    label_with_parent_segments(cwd).unwrap_or_else(|| cwd.display().to_string())
 }
 
 fn is_home_dir(cwd: &Path) -> bool {
@@ -56,7 +56,9 @@ fn is_home_dir(cwd: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn label_with_parent_segments(path: &Path, parent_segments: usize) -> Option<String> {
+/// `path`'s file name, prefixed with `label_parent_segments()` ancestor
+/// directory names joined with `/`, e.g. `herdr` becomes `other/herdr`.
+fn label_with_parent_segments(path: &Path) -> Option<String> {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -64,7 +66,7 @@ fn label_with_parent_segments(path: &Path, parent_segments: usize) -> Option<Str
 
     let mut segments = vec![name];
     let mut ancestor = path.parent();
-    for _ in 0..parent_segments {
+    for _ in 0..label_parent_segments() {
         let parent_name = ancestor
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
@@ -102,11 +104,7 @@ pub fn git_space_metadata(cwd: &Path) -> Option<GitSpaceMetadata> {
 }
 
 pub(crate) fn automatic_workspace_label(cwd: &Path, repo_root: &Path) -> String {
-    repo_root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| fallback_label_from_cwd(cwd))
+    label_with_parent_segments(repo_root).unwrap_or_else(|| fallback_label_from_cwd(cwd))
 }
 
 pub(super) fn git_space_metadata_from_info(info: &GitWorktreeInfo) -> GitSpaceMetadata {
@@ -162,6 +160,65 @@ fn git_common_dir_for_git_dir(git_dir: &Path) -> PathBuf {
     }
 }
 
+/// Outcome of reading one Git ref file, classified without collapsing metadata
+/// errors so callers can distinguish "this ref does not exist" from "this ref
+/// exists (or cannot be ruled out) but its content must not be trusted".
+/// `Path::exists()` cannot distinguish them because it returns `false` on
+/// metadata errors. When opening reports `NotFound` or `NotADirectory`,
+/// `symlink_metadata` distinguishes a genuinely absent path from a dangling
+/// symlink without following the final link.
+pub(super) enum RefFileRead {
+    Content(String),
+    Absent,
+    Unavailable,
+}
+
+pub(super) fn read_git_ref_file_state(path: &Path) -> RefFileRead {
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return match std::fs::symlink_metadata(path) {
+                // The directory entry exists but its symlink target is missing
+                // or traverses a non-directory. Git treats the loose ref as
+                // broken and does not fall back to an older packed ref.
+                Ok(_) => RefFileRead::Unavailable,
+                Err(metadata_error)
+                    if metadata_error.kind() == std::io::ErrorKind::NotFound
+                        || metadata_error.kind() == std::io::ErrorKind::NotADirectory =>
+                {
+                    RefFileRead::Absent
+                }
+                Err(_) => RefFileRead::Unavailable,
+            };
+        }
+        // Permission or I/O errors: the ref may exist, so its identity is
+        // unavailable rather than absent.
+        Err(_) => return RefFileRead::Unavailable,
+    };
+    let mut contents = String::new();
+    if file
+        .take((MAX_GIT_REF_FILE_BYTES + 1) as u64)
+        .read_to_string(&mut contents)
+        .is_err()
+        || contents.len() > MAX_GIT_REF_FILE_BYTES
+    {
+        return RefFileRead::Unavailable;
+    }
+    RefFileRead::Content(contents)
+}
+
+pub(super) fn read_git_ref_file(path: &Path) -> Option<String> {
+    match read_git_ref_file_state(path) {
+        RefFileRead::Content(contents) => Some(contents),
+        RefFileRead::Absent | RefFileRead::Unavailable => None,
+    }
+}
+
 pub fn git_branch(cwd: &Path) -> Option<String> {
     let repo_root = git_repo_root(cwd)?;
     let git_dir = git_dir_for_repo_root(&repo_root)?;
@@ -170,7 +227,7 @@ pub fn git_branch(cwd: &Path) -> Option<String> {
         return git_symbolic_head_short(&repo_root);
     }
 
-    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = read_git_ref_file(&git_dir.join("HEAD"))?;
     parse_git_head_branch(&head)
 }
 
@@ -309,11 +366,22 @@ pub(super) fn git_repo_root(start: &Path) -> Option<PathBuf> {
 
 pub(super) fn read_ref_oid(common_dir: &Path, full_ref: &str) -> Option<String> {
     let loose_ref = common_dir.join(full_ref);
-    if let Ok(contents) = std::fs::read_to_string(loose_ref) {
-        let oid = contents.trim();
-        if !oid.is_empty() {
+    match read_git_ref_file_state(&loose_ref) {
+        RefFileRead::Content(contents) => {
+            let oid = contents.trim();
+            if oid.is_empty() {
+                // An empty loose ref is present but broken. Git does not fall
+                // back to an older same-name packed ref in this case.
+                return None;
+            }
             return Some(oid.to_string());
         }
+        // A loose ref that exists — or whose existence cannot be ruled out
+        // because of a metadata or I/O error — must not fall back to
+        // packed-refs: that could resurrect a stale same-name OID into the
+        // status fingerprint. Report the ref as unavailable instead.
+        RefFileRead::Unavailable => return None,
+        RefFileRead::Absent => {}
     }
 
     let packed_refs = std::fs::read_to_string(common_dir.join("packed-refs")).ok()?;
@@ -364,6 +432,201 @@ mod tests {
         assert_eq!(git_branch(&root).as_deref(), Some("main"));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn oversized_loose_ref_is_unavailable_not_absent() {
+        let root = temp_test_dir("oversized-loose-ref");
+        let refs_dir = root.join("refs/heads");
+        std::fs::create_dir_all(&refs_dir).unwrap();
+        std::fs::write(
+            root.join("packed-refs"),
+            "# pack-refs with: peeled fully-peeled sorted \naaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/main\n",
+        )
+        .unwrap();
+        let loose = refs_dir.join("main");
+        std::fs::write(&loose, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(loose)
+            .unwrap()
+            .set_len(8 * 1024 * 1024)
+            .unwrap();
+
+        let oid = read_ref_oid(&root, "refs/heads/main");
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            oid, None,
+            "an oversized loose ref must make the ref unavailable, not fall back to the stale packed OID"
+        );
+    }
+
+    #[test]
+    fn empty_or_whitespace_loose_ref_is_unavailable_not_absent() {
+        let root = temp_test_dir("empty-loose-ref");
+        let refs_dir = root.join("refs/heads");
+        std::fs::create_dir_all(&refs_dir).unwrap();
+        std::fs::write(
+            root.join("packed-refs"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/main\n",
+        )
+        .unwrap();
+        let loose = refs_dir.join("main");
+
+        for contents in ["", " \n\t"] {
+            std::fs::write(&loose, contents).unwrap();
+            assert_eq!(
+                read_ref_oid(&root, "refs/heads/main"),
+                None,
+                "an empty or whitespace-only loose ref must not fall back to the stale packed OID"
+            );
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_loose_ref_is_unavailable_not_absent() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_test_dir("dangling-symlink-loose-ref");
+        let refs_dir = root.join("refs/heads");
+        std::fs::create_dir_all(&refs_dir).unwrap();
+        std::fs::write(
+            root.join("packed-refs"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/main\n",
+        )
+        .unwrap();
+        symlink("missing-target", refs_dir.join("main")).unwrap();
+
+        let oid = read_ref_oid(&root, "refs/heads/main");
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            oid, None,
+            "a dangling loose ref must not fall back to the stale packed OID"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlink_through_file_is_unavailable_not_absent() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_test_dir("dangling-symlink-through-file");
+        let refs_dir = root.join("refs/heads");
+        std::fs::create_dir_all(&refs_dir).unwrap();
+        std::fs::write(
+            root.join("packed-refs"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/main\n",
+        )
+        .unwrap();
+        std::fs::write(refs_dir.join("target-parent"), "not a directory").unwrap();
+        symlink("target-parent/nested", refs_dir.join("main")).unwrap();
+
+        let oid = read_ref_oid(&root, "refs/heads/main");
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            oid, None,
+            "a dangling loose ref whose target traverses a file must not fall back to the stale packed OID"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_loose_ref_dir_is_unavailable_not_absent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_test_dir("unreadable-loose-ref");
+        let refs_dir = root.join("refs/heads");
+        std::fs::create_dir_all(&refs_dir).unwrap();
+        std::fs::write(
+            root.join("packed-refs"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/main\n",
+        )
+        .unwrap();
+        std::fs::write(
+            refs_dir.join("main"),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&refs_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let oid = read_ref_oid(&root, "refs/heads/main");
+        std::fs::set_permissions(&refs_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            oid, None,
+            "a loose ref behind a metadata error must be unavailable, not fall back to the stale packed OID"
+        );
+    }
+
+    #[test]
+    fn ref_path_through_a_file_still_reads_packed_refs() {
+        let root = temp_test_dir("ref-path-through-file");
+        let refs_dir = root.join("refs/heads");
+        std::fs::create_dir_all(&refs_dir).unwrap();
+        // refs/heads/main is a file, so refs/heads/main/nested cannot exist as
+        // a loose ref; the packed entry is the legitimate source.
+        std::fs::write(
+            refs_dir.join("main"),
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("packed-refs"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/main/nested\n",
+        )
+        .unwrap();
+
+        let oid = read_ref_oid(&root, "refs/heads/main/nested");
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            oid.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+    }
+
+    #[test]
+    fn absent_loose_ref_still_reads_packed_refs() {
+        let root = temp_test_dir("packed-only-ref");
+        std::fs::create_dir_all(root.join("refs/heads")).unwrap();
+        std::fs::write(
+            root.join("packed-refs"),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa refs/heads/main\n",
+        )
+        .unwrap();
+
+        let oid = read_ref_oid(&root, "refs/heads/main");
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            oid.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+    }
+
+    #[test]
+    fn oversized_git_head_is_rejected() {
+        let root = temp_test_dir("oversized-head");
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        let head = git_dir.join("HEAD");
+        std::fs::write(&head, "ref: refs/heads/main\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(head)
+            .unwrap()
+            .set_len(60 * 1024 * 1024)
+            .unwrap();
+
+        let branch = git_branch(&root);
+        let branch_len = branch.as_ref().map(String::len);
+        std::fs::remove_dir_all(root).unwrap();
+
+        assert!(
+            branch.is_none(),
+            "oversized Git HEAD produced branch with {branch_len:?} bytes"
+        );
     }
 
     #[test]
@@ -558,7 +821,7 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
 
         assert_eq!(
-            derive_label_from_cwd(&nested, 0),
+            derive_label_from_cwd(&nested),
             root.file_name().and_then(|name| name.to_str()).unwrap()
         );
 
@@ -570,56 +833,32 @@ mod tests {
         let root = temp_test_dir("label-plain");
         let label = root.file_name().and_then(|name| name.to_str()).unwrap();
 
-        assert_eq!(derive_label_from_cwd(Path::new(&root), 0), label);
+        assert_eq!(derive_label_from_cwd(Path::new(&root)), label);
 
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn derive_label_includes_requested_parent_segments() {
+    fn derive_label_prepends_configured_parent_segments() {
         let root = temp_test_dir("label-parent");
-        let nested = root.join("nested");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-        std::fs::create_dir_all(&nested).unwrap();
+        let repo_nested = root.join("repo/nested");
+        std::fs::create_dir_all(root.join("repo/.git")).unwrap();
+        std::fs::write(root.join("repo/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(&repo_nested).unwrap();
+        let plain = root.join("plain/dir");
+        std::fs::create_dir_all(&plain).unwrap();
+        let root_name = root.file_name().and_then(|name| name.to_str()).unwrap();
 
-        let repo_name = root.file_name().and_then(|name| name.to_str()).unwrap();
-        let parent_name = root
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|name| name.to_str())
-            .unwrap();
+        set_label_parent_segments(1);
+        let repo_label = derive_label_from_cwd(&repo_nested);
+        let plain_label = derive_label_from_cwd(&plain);
+        let clamped = derive_label_from_cwd(Path::new("/"));
+        set_label_parent_segments(0);
 
-        assert_eq!(
-            derive_label_from_cwd(&nested, 1),
-            format!("{parent_name}/{repo_name}")
-        );
-
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn derive_label_parent_segments_clamp_at_filesystem_root() {
-        assert_eq!(derive_label_from_cwd(Path::new("/"), 5), "/");
-    }
-
-    #[test]
-    fn derive_label_includes_parent_segments_without_git_repo() {
-        let root = temp_test_dir("label-parent-non-git");
-        let nested = root.join("nested");
-        std::fs::create_dir_all(&nested).unwrap();
-
-        let dir_name = nested.file_name().and_then(|name| name.to_str()).unwrap();
-        let parent_name = nested
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|name| name.to_str())
-            .unwrap();
-
-        assert_eq!(
-            derive_label_from_cwd(&nested, 1),
-            format!("{parent_name}/{dir_name}")
-        );
+        assert_eq!(repo_label, format!("{root_name}/repo"));
+        assert_eq!(plain_label, "plain/dir");
+        assert_eq!(clamped, "/");
+        assert_eq!(derive_label_from_cwd(&repo_nested), "repo");
 
         std::fs::remove_dir_all(root).unwrap();
     }
